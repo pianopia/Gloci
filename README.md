@@ -107,6 +107,66 @@ List jobs:
 curl -s http://localhost:8080/scheduler/v1/jobs
 ```
 
+## Compatibility Endpoints (Partial)
+
+Gloci now also accepts a subset of Google Cloud-style endpoint shapes.
+
+Pub/Sub topic create:
+
+```bash
+curl -s -X PUT http://localhost:8080/v1/projects/local/topics/my-topic
+```
+
+Pub/Sub publish:
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"data":"hello"}]}' \
+  http://localhost:8080/v1/projects/local/topics/my-topic:publish
+```
+
+Pub/Sub subscription create:
+
+```bash
+curl -s -X PUT \
+  -H 'Content-Type: application/json' \
+  -d '{"topic":"projects/local/topics/my-topic"}' \
+  http://localhost:8080/v1/projects/local/subscriptions/my-sub
+```
+
+Pub/Sub pull:
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"maxMessages":10}' \
+  http://localhost:8080/v1/projects/local/subscriptions/my-sub:pull
+```
+
+Storage bucket create (JSON API style):
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"my-bucket"}' \
+  'http://localhost:8080/storage/v1/b?project=local'
+```
+
+Storage upload (simple upload style):
+
+```bash
+curl -s -X POST --data 'hello world' \
+  'http://localhost:8080/upload/storage/v1/b/my-bucket/o?uploadType=media&name=greeting.txt'
+```
+
+Storage download:
+
+```bash
+curl -s \
+  http://localhost:8080/download/storage/v1/b/my-bucket/o/greeting.txt
+```
+
 ## Notes
 - Data is in-memory only; restarting the process clears all resources.
-- API shapes are intentionally simple for MVP and are not yet fully GCP-compatible.
+- Google Cloud compatibility is still partial; only common endpoint shapes are covered.

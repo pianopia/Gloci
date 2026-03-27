@@ -19,7 +19,8 @@
 - [x] Add usage docs (`README.md`).
 
 ## Phase 2 (next)
-- [ ] Improve API compatibility with official Google Cloud emulator-style endpoints.
+- [x] Improve API compatibility with official Google Cloud emulator-style endpoints.
+  - Added partial compatibility routes for Pub/Sub (`/v1/projects/...`) and Storage JSON API style (`/storage/v1/b`, `/upload/storage/v1/b/...`, `/download/storage/v1/b/...`).
 - [ ] Add persistence option for Storage and queued Pub/Sub messages.
 - [ ] Add ack/ackDeadline semantics to Pub/Sub pull flow.
 - [ ] Add cron expression parsing for Scheduler.
