@@ -19,10 +19,16 @@ type
     attributes: JsonNode
     publishTime: string
 
+  InFlightMessage = object
+    message: PubsubMessage
+    deadlineEpoch: int64
+
   Subscription = ref object
     name: string
     topic: string
+    ackDeadlineSeconds: int
     queue: seq[PubsubMessage]
+    inFlight: Table[string, InFlightMessage]
 
   SchedulerJob = ref object
     name: string
@@ -38,14 +44,18 @@ type
     subscriptions: Table[string, Subscription]
     jobs: Table[string, SchedulerJob]
     nextMessageId: uint64
+    nextAckId: uint64
+    persistencePath: string
 
-proc newAppState(): AppState =
+proc newAppState(persistencePath: string = ""): AppState =
   AppState(
     buckets: initTable[string, Bucket](),
     topics: initTable[string, Topic](),
     subscriptions: initTable[string, Subscription](),
     jobs: initTable[string, SchedulerJob](),
-    nextMessageId: 0'u64
+    nextMessageId: 0'u64,
+    nextAckId: 0'u64,
+    persistencePath: persistencePath
   )
 
 proc nowUnix(): int64 =
@@ -109,22 +119,323 @@ proc parseMaxMessages(body: JsonNode; maxMessages: var int; err: var string): bo
     maxMessages = 1
   true
 
-proc pullMessages(subName: string; sub: Subscription; maxMessages: int): JsonNode =
+proc parseSubscriptionAckDeadline(body: JsonNode; ackDeadlineSeconds: var int; err: var string): bool =
+  ackDeadlineSeconds = 10
+  if body.hasKey("ackDeadlineSeconds"):
+    if body["ackDeadlineSeconds"].kind != JInt:
+      err = "ackDeadlineSeconds must be integer"
+      return false
+    ackDeadlineSeconds = body["ackDeadlineSeconds"].getInt()
+  if ackDeadlineSeconds < 1 or ackDeadlineSeconds > 600:
+    err = "ackDeadlineSeconds must be between 1 and 600"
+    return false
+  true
+
+proc parseAckIds(body: JsonNode; ackIds: var seq[string]; err: var string): bool =
+  if not body.hasKey("ackIds") or body["ackIds"].kind != JArray:
+    err = "ackIds must be array"
+    return false
+  for ackIdNode in body["ackIds"].items:
+    if ackIdNode.kind != JString:
+      err = "ackIds must contain strings"
+      return false
+    let ackId = ackIdNode.getStr().strip()
+    if ackId.len > 0:
+      ackIds.add(ackId)
+  true
+
+proc parseModifyAckDeadline(body: JsonNode; ackDeadlineSeconds: var int; err: var string): bool =
+  if not body.hasKey("ackDeadlineSeconds") or body["ackDeadlineSeconds"].kind != JInt:
+    err = "ackDeadlineSeconds must be integer"
+    return false
+  ackDeadlineSeconds = body["ackDeadlineSeconds"].getInt()
+  if ackDeadlineSeconds < 0 or ackDeadlineSeconds > 600:
+    err = "ackDeadlineSeconds must be between 0 and 600"
+    return false
+  true
+
+proc parsePubsubMessage(node: JsonNode; message: var PubsubMessage): bool =
+  if node.kind != JObject:
+    return false
+  if not node.hasKey("messageId") or node["messageId"].kind != JString:
+    return false
+  message.messageId = node["messageId"].getStr()
+  message.data = ""
+  if node.hasKey("data") and node["data"].kind == JString:
+    message.data = node["data"].getStr()
+  message.attributes = newJObject()
+  if node.hasKey("attributes") and node["attributes"].kind == JObject:
+    message.attributes = node["attributes"]
+  message.publishTime = ""
+  if node.hasKey("publishTime") and node["publishTime"].kind == JString:
+    message.publishTime = node["publishTime"].getStr()
+  true
+
+proc pubsubMessageToJson(message: PubsubMessage): JsonNode =
+  %*{
+    "messageId": message.messageId,
+    "data": message.data,
+    "attributes": message.attributes,
+    "publishTime": message.publishTime
+  }
+
+proc persistState(state: AppState) =
+  if state.persistencePath.len == 0:
+    return
+
+  var persisted = newJObject()
+  persisted["version"] = %1
+  persisted["nextMessageId"] = %($state.nextMessageId)
+  persisted["nextAckId"] = %($state.nextAckId)
+
+  var buckets = newJArray()
+  for _, bucket in state.buckets:
+    var objects = newJArray()
+    for _, obj in bucket.objects:
+      objects.add(%*{
+        "name": obj.name,
+        "data": obj.data,
+        "updatedAt": obj.updatedAt
+      })
+    buckets.add(%*{
+      "name": bucket.name,
+      "objects": objects
+    })
+  persisted["buckets"] = buckets
+
+  var topics = newJArray()
+  for _, topic in state.topics:
+    topics.add(%*{"name": topic.name})
+  persisted["topics"] = topics
+
+  var subscriptions = newJArray()
+  for _, sub in state.subscriptions:
+    var queue = newJArray()
+    for msg in sub.queue:
+      queue.add(pubsubMessageToJson(msg))
+    var inFlightEntries = newJArray()
+    for ackId, inFlight in sub.inFlight:
+      inFlightEntries.add(%*{
+        "ackId": ackId,
+        "deadlineEpoch": inFlight.deadlineEpoch,
+        "message": pubsubMessageToJson(inFlight.message)
+      })
+    subscriptions.add(%*{
+      "name": sub.name,
+      "topic": sub.topic,
+      "ackDeadlineSeconds": sub.ackDeadlineSeconds,
+      "queue": queue,
+      "inFlight": inFlightEntries
+    })
+  persisted["subscriptions"] = subscriptions
+
+  try:
+    let dataDir = splitFile(state.persistencePath).dir
+    if dataDir.len > 0 and not dirExists(dataDir):
+      createDir(dataDir)
+    writeFile(state.persistencePath, $persisted)
+  except OSError as ex:
+    echo "Failed to persist state to " & state.persistencePath & ": " & ex.msg
+
+proc loadState(state: AppState) =
+  if state.persistencePath.len == 0 or not fileExists(state.persistencePath):
+    return
+
+  try:
+    let persisted = parseJson(readFile(state.persistencePath))
+    if persisted.kind != JObject:
+      echo "Persisted state is invalid JSON object: " & state.persistencePath
+      return
+
+    if persisted.hasKey("nextMessageId"):
+      let messageIdNode = persisted["nextMessageId"]
+      if messageIdNode.kind == JString:
+        try:
+          state.nextMessageId = parseBiggestUInt(messageIdNode.getStr())
+        except ValueError:
+          discard
+      elif messageIdNode.kind == JInt:
+        let raw = messageIdNode.getBiggestInt()
+        if raw >= 0:
+          state.nextMessageId = uint64(raw)
+
+    if persisted.hasKey("nextAckId"):
+      let ackIdNode = persisted["nextAckId"]
+      if ackIdNode.kind == JString:
+        try:
+          state.nextAckId = parseBiggestUInt(ackIdNode.getStr())
+        except ValueError:
+          discard
+      elif ackIdNode.kind == JInt:
+        let raw = ackIdNode.getBiggestInt()
+        if raw >= 0:
+          state.nextAckId = uint64(raw)
+
+    if persisted.hasKey("buckets") and persisted["buckets"].kind == JArray:
+      for bucketNode in persisted["buckets"].items:
+        if bucketNode.kind != JObject:
+          continue
+        if not bucketNode.hasKey("name") or bucketNode["name"].kind != JString:
+          continue
+        let bucketName = bucketNode["name"].getStr().strip()
+        if bucketName.len == 0:
+          continue
+        let bucket = Bucket(name: bucketName, objects: initTable[string, StoredObject]())
+        if bucketNode.hasKey("objects") and bucketNode["objects"].kind == JArray:
+          for objectNode in bucketNode["objects"].items:
+            if objectNode.kind != JObject:
+              continue
+            if not objectNode.hasKey("name") or objectNode["name"].kind != JString:
+              continue
+            if not objectNode.hasKey("data") or objectNode["data"].kind != JString:
+              continue
+            var updatedAt: int64 = 0
+            if objectNode.hasKey("updatedAt") and objectNode["updatedAt"].kind == JInt:
+              updatedAt = int64(objectNode["updatedAt"].getBiggestInt())
+            let objectName = objectNode["name"].getStr()
+            bucket.objects[objectName] = StoredObject(
+              name: objectName,
+              data: objectNode["data"].getStr(),
+              updatedAt: updatedAt
+            )
+        state.buckets[bucketName] = bucket
+
+    if persisted.hasKey("topics") and persisted["topics"].kind == JArray:
+      for topicNode in persisted["topics"].items:
+        if topicNode.kind != JObject:
+          continue
+        if not topicNode.hasKey("name") or topicNode["name"].kind != JString:
+          continue
+        let topicName = topicNode["name"].getStr().strip()
+        if topicName.len == 0:
+          continue
+        state.topics[topicName] = Topic(name: topicName)
+
+    if persisted.hasKey("subscriptions") and persisted["subscriptions"].kind == JArray:
+      for subNode in persisted["subscriptions"].items:
+        if subNode.kind != JObject:
+          continue
+        if not subNode.hasKey("name") or subNode["name"].kind != JString:
+          continue
+        if not subNode.hasKey("topic") or subNode["topic"].kind != JString:
+          continue
+
+        let subName = subNode["name"].getStr().strip()
+        let topicName = subNode["topic"].getStr().strip()
+        if subName.len == 0 or topicName.len == 0:
+          continue
+        if not state.topics.hasKey(topicName):
+          continue
+
+        var ackDeadlineSeconds = 10
+        if subNode.hasKey("ackDeadlineSeconds") and subNode["ackDeadlineSeconds"].kind == JInt:
+          let parsed = subNode["ackDeadlineSeconds"].getInt()
+          if parsed >= 1 and parsed <= 600:
+            ackDeadlineSeconds = parsed
+
+        var queue: seq[PubsubMessage] = @[]
+        if subNode.hasKey("queue") and subNode["queue"].kind == JArray:
+          for queueNode in subNode["queue"].items:
+            var message: PubsubMessage
+            if parsePubsubMessage(queueNode, message):
+              queue.add(message)
+
+        var inFlight = initTable[string, InFlightMessage]()
+        if subNode.hasKey("inFlight") and subNode["inFlight"].kind == JArray:
+          for inFlightNode in subNode["inFlight"].items:
+            if inFlightNode.kind != JObject:
+              continue
+            if not inFlightNode.hasKey("ackId") or inFlightNode["ackId"].kind != JString:
+              continue
+            if not inFlightNode.hasKey("message"):
+              continue
+            let ackId = inFlightNode["ackId"].getStr().strip()
+            if ackId.len == 0:
+              continue
+            var message: PubsubMessage
+            if not parsePubsubMessage(inFlightNode["message"], message):
+              continue
+            var deadlineEpoch: int64 = nowUnix() + int64(ackDeadlineSeconds)
+            if inFlightNode.hasKey("deadlineEpoch") and inFlightNode["deadlineEpoch"].kind == JInt:
+              deadlineEpoch = int64(inFlightNode["deadlineEpoch"].getBiggestInt())
+            inFlight[ackId] = InFlightMessage(message: message, deadlineEpoch: deadlineEpoch)
+
+        state.subscriptions[subName] = Subscription(
+          name: subName,
+          topic: topicName,
+          ackDeadlineSeconds: ackDeadlineSeconds,
+          queue: queue,
+          inFlight: inFlight
+        )
+  except CatchableError as ex:
+    echo "Failed to load persisted state from " & state.persistencePath & ": " & ex.msg
+
+proc reclaimExpiredInFlight(sub: Subscription; nowEpoch: int64): bool =
+  var expiredAckIds: seq[string] = @[]
+  for ackId, inFlight in sub.inFlight:
+    if inFlight.deadlineEpoch <= nowEpoch:
+      expiredAckIds.add(ackId)
+  for ackId in expiredAckIds:
+    if sub.inFlight.hasKey(ackId):
+      sub.queue.add(sub.inFlight[ackId].message)
+      sub.inFlight.del(ackId)
+  expiredAckIds.len > 0
+
+proc reclaimExpiredAckDeadlines(state: AppState; nowEpoch: int64): bool =
+  for _, sub in state.subscriptions.mpairs:
+    if reclaimExpiredInFlight(sub, nowEpoch):
+      result = true
+
+proc generateAckId(state: AppState; subName: string): string =
+  inc state.nextAckId
+  subName & ":" & $state.nextAckId
+
+proc pullMessages(state: AppState; subName: string; sub: Subscription; maxMessages: int): JsonNode =
+  let ts = nowUnix()
+  var changed = reclaimExpiredInFlight(sub, ts)
+
   result = newJArray()
   var count = 0
   while sub.queue.len > 0 and count < maxMessages:
     let msg = sub.queue[0]
     sub.queue.delete(0)
+    let ackId = state.generateAckId(subName)
+    sub.inFlight[ackId] = InFlightMessage(
+      message: msg,
+      deadlineEpoch: ts + int64(sub.ackDeadlineSeconds)
+    )
     result.add(%*{
-      "ackId": subName & ":" & msg.messageId,
-      "message": {
-        "messageId": msg.messageId,
-        "data": msg.data,
-        "attributes": msg.attributes,
-        "publishTime": msg.publishTime
-      }
+      "ackId": ackId,
+      "message": pubsubMessageToJson(msg)
     })
     inc count
+    changed = true
+
+  if changed:
+    state.persistState()
+
+proc acknowledgeMessages(sub: Subscription; ackIds: seq[string]): int =
+  for ackId in ackIds:
+    if sub.inFlight.hasKey(ackId):
+      sub.inFlight.del(ackId)
+      inc result
+
+proc modifyAckDeadlines(sub: Subscription; ackIds: seq[string]; ackDeadlineSeconds: int): int =
+  let nowEpoch = nowUnix()
+  for ackId in ackIds:
+    if not sub.inFlight.hasKey(ackId):
+      continue
+    let inFlight = sub.inFlight[ackId]
+    if ackDeadlineSeconds == 0:
+      sub.queue.add(inFlight.message)
+      sub.inFlight.del(ackId)
+      inc result
+      continue
+    sub.inFlight[ackId] = InFlightMessage(
+      message: inFlight.message,
+      deadlineEpoch: nowEpoch + int64(ackDeadlineSeconds)
+    )
+    inc result
 
 proc storageObjectMetadata(bucketName: string; obj: StoredObject): JsonNode =
   %*{
@@ -177,6 +488,8 @@ proc publishMessages(state: AppState; topicName: string; messages: seq[JsonNode]
     )
     state.fanOutMessage(topicName, message)
     result.add(messageId)
+  if result.len > 0:
+    state.persistState()
 
 proc runSchedulerJob(state: AppState; job: SchedulerJob) =
   if not state.topics.hasKey(job.topic):
@@ -196,6 +509,8 @@ proc runSchedulerJob(state: AppState; job: SchedulerJob) =
 proc schedulerLoop(state: AppState) {.async, gcsafe.} =
   while true:
     let ts = nowUnix()
+    if state.reclaimExpiredAckDeadlines(ts):
+      state.persistState()
     for _, job in state.jobs.mpairs:
       if job.everySeconds > 0 and ts >= job.nextRunEpoch:
         state.runSchedulerJob(job)
@@ -239,6 +554,7 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
         await errorResponse(req, Http409, "Bucket already exists")
         return
       state.buckets[bucketName] = Bucket(name: bucketName, objects: initTable[string, StoredObject]())
+      state.persistState()
       await jsonResponse(req, Http200, %*{"name": bucketName})
       return
 
@@ -293,6 +609,7 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
         data: objectData,
         updatedAt: nowUnix()
       )
+      state.persistState()
       await jsonResponse(req, Http200, storageObjectMetadata(bucketName, state.buckets[bucketName].objects[objectName]))
       return
 
@@ -333,6 +650,7 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
         await errorResponse(req, Http409, "Topic already exists")
         return
       state.topics[topicName] = Topic(name: topicName)
+      state.persistState()
       await jsonResponse(req, Http200, %*{"name": pubsubTopicFullName(projectId, topicName)})
       return
 
@@ -367,7 +685,8 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
       for _, sub in state.subscriptions:
         subscriptions.add(%*{
           "name": pubsubSubscriptionFullName(projectId, sub.name),
-          "topic": pubsubTopicFullName(projectId, sub.topic)
+          "topic": pubsubTopicFullName(projectId, sub.topic),
+          "ackDeadlineSeconds": sub.ackDeadlineSeconds
         })
       await jsonResponse(req, Http200, %*{"subscriptions": subscriptions})
       return
@@ -387,6 +706,11 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
       if not body.hasKey("topic") or body["topic"].kind != JString:
         await errorResponse(req, Http400, "Request must include topic")
         return
+      var ackDeadlineSeconds = 10
+      var ackDeadlineErr = ""
+      if not parseSubscriptionAckDeadline(body, ackDeadlineSeconds, ackDeadlineErr):
+        await errorResponse(req, Http400, ackDeadlineErr)
+        return
 
       var topicName = ""
       if not parsePubsubResourceName(body["topic"].getStr(), "topics", topicName):
@@ -398,10 +722,18 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
       if state.subscriptions.hasKey(subName):
         await errorResponse(req, Http409, "Subscription already exists")
         return
-      state.subscriptions[subName] = Subscription(name: subName, topic: topicName, queue: @[])
+      state.subscriptions[subName] = Subscription(
+        name: subName,
+        topic: topicName,
+        ackDeadlineSeconds: ackDeadlineSeconds,
+        queue: @[],
+        inFlight: initTable[string, InFlightMessage]()
+      )
+      state.persistState()
       await jsonResponse(req, Http200, %*{
         "name": pubsubSubscriptionFullName(projectId, subName),
-        "topic": pubsubTopicFullName(projectId, topicName)
+        "topic": pubsubTopicFullName(projectId, topicName),
+        "ackDeadlineSeconds": ackDeadlineSeconds
       })
       return
 
@@ -424,7 +756,7 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
       if not parseMaxMessages(body, maxMessages, maxErr):
         await errorResponse(req, Http400, maxErr)
         return
-      let pulled = pullMessages(subName, state.subscriptions[subName], maxMessages)
+      let pulled = state.pullMessages(subName, state.subscriptions[subName], maxMessages)
       await jsonResponse(req, Http200, %*{"receivedMessages": pulled})
       return
 
@@ -441,9 +773,43 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
       if not parseBodyJson(req, body, parseErr):
         await errorResponse(req, Http400, "Invalid JSON body: " & parseErr)
         return
-      if body.hasKey("ackIds") and body["ackIds"].kind != JArray:
-        await errorResponse(req, Http400, "ackIds must be array")
+      var ackIds: seq[string] = @[]
+      var ackErr = ""
+      if not parseAckIds(body, ackIds, ackErr):
+        await errorResponse(req, Http400, ackErr)
         return
+      let ackedCount = acknowledgeMessages(state.subscriptions[subName], ackIds)
+      if ackedCount > 0:
+        state.persistState()
+      await jsonResponse(req, Http200, %*{})
+      return
+
+    if req.reqMethod == HttpPost and parts[4].endsWith(":modifyAckDeadline"):
+      let subName = parts[4][0 ..< parts[4].len - ":modifyAckDeadline".len]
+      if subName.len == 0:
+        await errorResponse(req, Http400, "Invalid subscription name")
+        return
+      if not state.subscriptions.hasKey(subName):
+        await errorResponse(req, Http404, "Subscription not found")
+        return
+      var body: JsonNode
+      var parseErr = ""
+      if not parseBodyJson(req, body, parseErr):
+        await errorResponse(req, Http400, "Invalid JSON body: " & parseErr)
+        return
+      var ackIds: seq[string] = @[]
+      var ackErr = ""
+      if not parseAckIds(body, ackIds, ackErr):
+        await errorResponse(req, Http400, ackErr)
+        return
+      var ackDeadlineSeconds = 0
+      var deadlineErr = ""
+      if not parseModifyAckDeadline(body, ackDeadlineSeconds, deadlineErr):
+        await errorResponse(req, Http400, deadlineErr)
+        return
+      let changed = modifyAckDeadlines(state.subscriptions[subName], ackIds, ackDeadlineSeconds)
+      if changed > 0:
+        state.persistState()
       await jsonResponse(req, Http200, %*{})
       return
 
@@ -465,6 +831,7 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
         await errorResponse(req, Http409, "Bucket already exists")
         return
       state.buckets[bucketName] = Bucket(name: bucketName, objects: initTable[string, StoredObject]())
+      state.persistState()
       await jsonResponse(req, Http201, %*{"name": bucketName})
       return
 
@@ -499,6 +866,7 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
         data: objectData,
         updatedAt: nowUnix()
       )
+      state.persistState()
       await jsonResponse(req, Http201, %*{
         "bucket": bucketName,
         "name": objectName,
@@ -530,6 +898,7 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
         await errorResponse(req, Http409, "Topic already exists")
         return
       state.topics[topicName] = Topic(name: topicName)
+      state.persistState()
       await jsonResponse(req, Http201, %*{"name": topicName})
       return
 
@@ -562,7 +931,9 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
         subscriptions.add(%*{
           "name": sub.name,
           "topic": sub.topic,
-          "queuedMessages": sub.queue.len
+          "queuedMessages": sub.queue.len,
+          "inFlightMessages": sub.inFlight.len,
+          "ackDeadlineSeconds": sub.ackDeadlineSeconds
         })
       await jsonResponse(req, Http200, %*{"subscriptions": subscriptions})
       return
@@ -578,6 +949,11 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
       if not body.hasKey("topic") or body["topic"].kind != JString:
         await errorResponse(req, Http400, "Request must include topic")
         return
+      var ackDeadlineSeconds = 10
+      var ackDeadlineErr = ""
+      if not parseSubscriptionAckDeadline(body, ackDeadlineSeconds, ackDeadlineErr):
+        await errorResponse(req, Http400, ackDeadlineErr)
+        return
 
       let topicName = body["topic"].getStr()
       if not state.topics.hasKey(topicName):
@@ -586,8 +962,19 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
       if state.subscriptions.hasKey(subName):
         await errorResponse(req, Http409, "Subscription already exists")
         return
-      state.subscriptions[subName] = Subscription(name: subName, topic: topicName, queue: @[])
-      await jsonResponse(req, Http201, %*{"name": subName, "topic": topicName})
+      state.subscriptions[subName] = Subscription(
+        name: subName,
+        topic: topicName,
+        ackDeadlineSeconds: ackDeadlineSeconds,
+        queue: @[],
+        inFlight: initTable[string, InFlightMessage]()
+      )
+      state.persistState()
+      await jsonResponse(req, Http201, %*{
+        "name": subName,
+        "topic": topicName,
+        "ackDeadlineSeconds": ackDeadlineSeconds
+      })
       return
 
   if parts.len == 5 and parts[0] == "pubsub" and parts[1] == "v1" and parts[2] == "subscriptions" and parts[4] == "pull":
@@ -607,8 +994,59 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
       if not parseMaxMessages(body, maxMessages, maxErr):
         await errorResponse(req, Http400, maxErr)
         return
-      let pulled = pullMessages(subName, state.subscriptions[subName], maxMessages)
+      let pulled = state.pullMessages(subName, state.subscriptions[subName], maxMessages)
       await jsonResponse(req, Http200, %*{"receivedMessages": pulled})
+      return
+
+  if parts.len == 5 and parts[0] == "pubsub" and parts[1] == "v1" and
+      parts[2] == "subscriptions" and parts[4] == "acknowledge":
+    let subName = parts[3]
+    if req.reqMethod == HttpPost:
+      if not state.subscriptions.hasKey(subName):
+        await errorResponse(req, Http404, "Subscription not found")
+        return
+      var body: JsonNode
+      var parseErr = ""
+      if not parseBodyJson(req, body, parseErr):
+        await errorResponse(req, Http400, "Invalid JSON body: " & parseErr)
+        return
+      var ackIds: seq[string] = @[]
+      var ackErr = ""
+      if not parseAckIds(body, ackIds, ackErr):
+        await errorResponse(req, Http400, ackErr)
+        return
+      let ackedCount = acknowledgeMessages(state.subscriptions[subName], ackIds)
+      if ackedCount > 0:
+        state.persistState()
+      await jsonResponse(req, Http200, %*{})
+      return
+
+  if parts.len == 5 and parts[0] == "pubsub" and parts[1] == "v1" and
+      parts[2] == "subscriptions" and parts[4] == "modifyAckDeadline":
+    let subName = parts[3]
+    if req.reqMethod == HttpPost:
+      if not state.subscriptions.hasKey(subName):
+        await errorResponse(req, Http404, "Subscription not found")
+        return
+      var body: JsonNode
+      var parseErr = ""
+      if not parseBodyJson(req, body, parseErr):
+        await errorResponse(req, Http400, "Invalid JSON body: " & parseErr)
+        return
+      var ackIds: seq[string] = @[]
+      var ackErr = ""
+      if not parseAckIds(body, ackIds, ackErr):
+        await errorResponse(req, Http400, ackErr)
+        return
+      var ackDeadlineSeconds = 0
+      var deadlineErr = ""
+      if not parseModifyAckDeadline(body, ackDeadlineSeconds, deadlineErr):
+        await errorResponse(req, Http400, deadlineErr)
+        return
+      let changed = modifyAckDeadlines(state.subscriptions[subName], ackIds, ackDeadlineSeconds)
+      if changed > 0:
+        state.persistState()
+      await jsonResponse(req, Http200, %*{})
       return
 
   if parts.len == 3 and parts[0] == "scheduler" and parts[1] == "v1" and parts[2] == "jobs":
@@ -684,7 +1122,9 @@ proc handleRequest(req: Request; state: AppState) {.async, gcsafe.} =
   await errorResponse(req, Http404, "Not found")
 
 proc main() =
-  let state = newAppState()
+  let persistencePath = getEnv("GLOCI_DATA_FILE", "").strip()
+  let state = newAppState(persistencePath)
+  state.loadState()
   asyncCheck schedulerLoop(state)
 
   let server = newAsyncHttpServer()

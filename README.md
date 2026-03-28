@@ -1,7 +1,7 @@
 # Gloci
 
 `gloci` is a local GCP emulator written in Nim.
-Current MVP supports in-memory emulation for Cloud Storage, Pub/Sub, and Cloud Scheduler.
+Current MVP supports Cloud Storage, Pub/Sub, and Cloud Scheduler, with optional local file persistence for Storage and queued Pub/Sub messages.
 
 ## Quick Start
 
@@ -16,6 +16,24 @@ Health check:
 ```bash
 curl -s http://localhost:8080/healthz
 ```
+
+## Persistence (Optional)
+
+Set `GLOCI_DATA_FILE` to enable persistence to a JSON file.
+
+Local run example:
+
+```bash
+GLOCI_DATA_FILE=./data/state.json ./gloci
+```
+
+Docker Compose example:
+
+```bash
+docker compose up --build
+```
+
+The provided compose file stores persisted state at `/data/state.json` in the `gloci_data` volume.
 
 ## API (MVP)
 
@@ -81,6 +99,24 @@ curl -s -X POST \
   http://localhost:8080/pubsub/v1/subscriptions/my-sub/pull
 ```
 
+Acknowledge:
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"ackIds":["my-sub:1"]}' \
+  http://localhost:8080/pubsub/v1/subscriptions/my-sub/acknowledge
+```
+
+Modify ack deadline (seconds, `0` means requeue immediately):
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"ackIds":["my-sub:1"],"ackDeadlineSeconds":30}' \
+  http://localhost:8080/pubsub/v1/subscriptions/my-sub/modifyAckDeadline
+```
+
 ### Scheduler
 
 Create job (every 5s):
@@ -144,6 +180,24 @@ curl -s -X POST \
   http://localhost:8080/v1/projects/local/subscriptions/my-sub:pull
 ```
 
+Pub/Sub acknowledge:
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"ackIds":["my-sub:1"]}' \
+  http://localhost:8080/v1/projects/local/subscriptions/my-sub:acknowledge
+```
+
+Pub/Sub modify ack deadline:
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"ackIds":["my-sub:1"],"ackDeadlineSeconds":30}' \
+  http://localhost:8080/v1/projects/local/subscriptions/my-sub:modifyAckDeadline
+```
+
 Storage bucket create (JSON API style):
 
 ```bash
@@ -168,5 +222,7 @@ curl -s \
 ```
 
 ## Notes
-- Data is in-memory only; restarting the process clears all resources.
+- If `GLOCI_DATA_FILE` is not set, data is in-memory only and restart clears all resources.
+- If `GLOCI_DATA_FILE` is set, Storage data and Pub/Sub queued/in-flight state are restored on startup.
+- Pub/Sub pull delivers messages to in-flight state; unacked messages are redelivered after `ackDeadlineSeconds` (default: 10).
 - Google Cloud compatibility is still partial; only common endpoint shapes are covered.
