@@ -1,7 +1,7 @@
 # Gloci
 
 `gloci` is a local GCP emulator written in Nim.
-Current MVP supports Cloud Storage, Pub/Sub, and Cloud Scheduler, with optional local file persistence for Storage and queued Pub/Sub messages.
+Current MVP supports Cloud Storage, Pub/Sub, Cloud Scheduler, and BigQuery (dataset/table/insertAll/data), with optional local file persistence for Storage, queued Pub/Sub messages, and BigQuery datasets/tables/rows.
 
 ## Quick Start
 
@@ -119,7 +119,7 @@ curl -s -X POST \
 
 ### Scheduler
 
-Create job (every 5s):
+Create interval job (every 5s):
 
 ```bash
 curl -s -X PUT \
@@ -127,6 +127,18 @@ curl -s -X PUT \
   -d '{"topic":"my-topic","payload":"from scheduler","everySeconds":5}' \
   http://localhost:8080/scheduler/v1/jobs/job-1
 ```
+
+Create cron job (UTC, 5-field cron):
+
+```bash
+curl -s -X PUT \
+  -H 'Content-Type: application/json' \
+  -d '{"topic":"my-topic","payload":"from cron","cron":"*/2 * * * *"}' \
+  http://localhost:8080/scheduler/v1/jobs/job-cron
+```
+
+Job create accepts exactly one schedule field: `everySeconds` or `cron`.
+Cron format is `minute hour day-of-month month day-of-week` and currently supports numeric values only (`day-of-week`: `0-6`, where `0` is Sunday).
 
 Run manually:
 
@@ -141,6 +153,42 @@ List jobs:
 
 ```bash
 curl -s http://localhost:8080/scheduler/v1/jobs
+```
+
+### BigQuery (MVP)
+
+Create dataset:
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"datasetReference":{"datasetId":"sales"},"location":"US"}' \
+  http://localhost:8080/bigquery/v2/projects/local/datasets
+```
+
+Create table:
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"tableReference":{"tableId":"orders"},"schema":{"fields":[{"name":"id","type":"STRING","mode":"REQUIRED"},{"name":"amount","type":"INTEGER"}]}}' \
+  http://localhost:8080/bigquery/v2/projects/local/datasets/sales/tables
+```
+
+Insert rows (`insertAll`):
+
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"rows":[{"insertId":"r1","json":{"id":"o-1","amount":10}}]}' \
+  http://localhost:8080/bigquery/v2/projects/local/datasets/sales/tables/orders/insertAll
+```
+
+List table rows:
+
+```bash
+curl -s \
+  'http://localhost:8080/bigquery/v2/projects/local/datasets/sales/tables/orders/data?maxResults=10'
 ```
 
 ## Compatibility Endpoints (Partial)
@@ -223,6 +271,6 @@ curl -s \
 
 ## Notes
 - If `GLOCI_DATA_FILE` is not set, data is in-memory only and restart clears all resources.
-- If `GLOCI_DATA_FILE` is set, Storage data and Pub/Sub queued/in-flight state are restored on startup.
+- If `GLOCI_DATA_FILE` is set, Storage data, Pub/Sub queued/in-flight state, and BigQuery datasets/tables/rows are restored on startup.
 - Pub/Sub pull delivers messages to in-flight state; unacked messages are redelivered after `ackDeadlineSeconds` (default: 10).
 - Google Cloud compatibility is still partial; only common endpoint shapes are covered.
